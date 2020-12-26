@@ -1,140 +1,110 @@
+from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Tuple, Union
 
-import records
-
-DEFAULT_DATA_PATH = Path(
-    Path.home(),
-    "Library/Group Containers/9K33E3U3T4.net.shinyfrog.bear/Application Data",
-)
-
-
-class DbObject(object):
-    """
-    Parent object for database derived objects
-
-    Exports all selected columns as attributes
-    """
-
-    def __init__(self, data: records.Record):
-        # ... could support other modes but lazy wins
-        if not isinstance(data, records.Record):
-            raise TypeError(
-                "Not sure how to handle anything other than records.Record..."
-            )
-
-        self.__db_record = data
-
-    def __getattr__(self, key) -> str:
-        # Fix Bear's nutty column naming scheme
-        key = "Z{}".format(key).upper()
-
-        try:
-            return self.__db_record[key]
-        except KeyError as e:
-            raise AttributeError(e)
-
-    @property
-    def key(self):
-        return self._pk
-
-
-class File(DbObject):
-    """
-    File object
-    """
-
-    @property
-    def path(self) -> Path:
-        # I have no idea why Bear differntiates the storage path between images and other
-        # files, but we'll deal with it crudely
-        if self.is_image():
-            modifier = "Note Images"
-        else:
-            modifier = "Note Files"
-
-        return Path(modifier, self.uniqueidentifier, self.filename)
-
-    def is_image(self) -> bool:
-        return self.normalizedfileextension in ("png", "jpeg", "gif")
-
-
-class Note(DbObject):
-    """
-    Note object
-    """
-
-    def title_slug(self, length: int = 128) -> str:
-        # TODO: parse title_slug from title
-        return "hi"
-
-    def has_files(self) -> bool:
-        return bool(self.hasfiles)
-
-    def has_images(self) -> bool:
-        return bool(self.hasimages)
-
-    def files(self) -> List[File]:
-        if not (self.has_images() or self.has_files()):
-            return []
-
-        # FIXME: Use passed path rather than default
-        db: records.Database = Bear().db()
-        query = """
-            select *
-            from ZSFNOTEFILE
-            where ZNOTE = :noteid
-        """
-        return list(map(File, db.query(query, noteid=self._pk)))
+import bear_exporter.base as base
+from bear_exporter.file import File
+from bear_exporter.note import Note
+from bear_exporter.tag import Tag, TagIndex
 
 
 class Bear(object):
-    """
-    Interact with Bear
-    """
+    """Interact with Bear"""
 
-    def __init__(self, base_path: Optional[str] = None) -> None:
-        self._base_path: Path = Path(base_path or DEFAULT_DATA_PATH)
-        self._db_file: Path = self._base_path.joinpath("database.sqlite")
-        self._file_path: Path = self._base_path.joinpath("Local Files")
+    def __init__(self, base_path: Optional[Union[str, Path]] = None) -> None:
+        if base_path:
+            self.config = BearConfig(base_path)
+        else:
+            self.config = BearConfig()
 
-        # We can't do much of anything without a database
-        if not self._db_file.is_file():
-            raise FileNotFoundError("Database not found: {}".format(self._db_file))
+        # Setup the database
+        base.database.init(self.config.db_path)
 
-    def db(self) -> records.Database:
-        if not hasattr(self, "_db"):
-            self._db: records.Database = records.Database(
-                "sqlite:///{}".format(self._db_file)
-            )
-        return self._db
+    def tags(self) -> List[Tag]:
+        return Tag.select()
 
-    def tags(self) -> List[str]:
-        query = """
-            select ZTITLE
-            from ZSFNOTETAG
-        """
-        return list(map(lambda r: r.get("ZTITLE"), self.db().query(query)))
+    def notes(
+        self,
+        tag: Optional[Tuple[str]] = None,
+        note_id: Optional[Tuple[int]] = None,
+        title: Optional[str] = None,
+    ) -> List[Note]:
+        """Query interface for notes stored in Bear.
 
-    def notes(self) -> List[Note]:
-        """
-        Returns a list of Note objects
+        Args:
+          tag: str: tag to query (Default value = None)
 
-        TODO: Add filtering
-        FIXME: probably should limit
-        """
-        query = """
-            select *
-            from ZSFNOTE
-        """
-        return list(map(Note, self.db().query(query)))
+        Returns:
+          A list of Note objects.
 
-    def files(self) -> List[File]:
         """
-        Returns a list of files
+        if tag:
+            # FIXME: Ugly
+            iq1 = Tag.select(Tag.id).where(Tag.title.in_(tag))
+            iq2 = TagIndex.select(TagIndex.note).where(TagIndex.tag.in_(iq1))
+            result = Note.select().where(Note.id.in_(iq2))
+        elif note_id:
+            result = Note.select().where(Note.id.in_(note_id))
+        elif title:
+            result = Note.select().where(Note.title.contains(title))
+        else:
+            # All not deleted
+            result = Note.select().where(Note.trashed == 0)
+
+        return result
+
+    def files(
+        self,
+        file_id: Optional[Tuple[int]] = None,
+        title: Optional[str] = None,
+        extension: Optional[str] = None,
+    ) -> List[File]:
+        """Query interface for files stored in Bear.
+
+        Args:
+
+        Returns:
+          A list of File objects.
         """
-        query = """
-            select *
-            from ZSFNOTEFILE
-        """
-        return list(map(File, self.db().query(query)))
+        if file_id:
+            result = File.select().where(File.id.in_(file_id))
+        elif title:
+            result = File.select().where(File.name.contains(title))
+        elif extension:
+            result = File.select().where(File.name.endswith(extension))
+        else:
+            result = File.select()
+
+        return result
+
+
+class BearException(Exception):
+    pass
+
+
+@dataclass
+class BearConfig(object):
+    base_path: Union[Path, str] = Path(
+        Path.home(),
+        "Library/Group Containers/9K33E3U3T4.net.shinyfrog.bear/Application Data",
+    )
+    db_file: Path = Path("database.sqlite")
+    file_stub: Path = Path("Local Files")
+
+    def __post_init__(self):
+        if type(self.base_path) is not Path:
+            self.base_path = Path(self.base_path)
+
+    @property
+    def db_path(self):
+        if not hasattr(self, "_db_path"):
+            db = Path(self.base_path, self.db_file)
+            # We can't do much of anything without a database
+            if not db.is_file():
+                raise FileNotFoundError("Database not found: " + str(db))
+            self._db_path = db
+        return self._db_path
+
+    @property
+    def file_path(self):
+        return Path(self.base_path, self.file_stub)
